@@ -20,6 +20,7 @@ import networkx as nx
 import numpy as np
 import torch
 import math
+from torch_sparse import SparseTensor, matmul
 
 from DGIB.pytorch_net.net import reparameterize, Mixture_Gaussian_reparam
 from DGIB.pytorch_net.util import (
@@ -49,82 +50,26 @@ from DGIB.util_IB import (
     add_distant_neighbors,
 )
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
 
-class RelTemporalEncoding(nn.Module):
-    def __init__(self, n_hid, max_len=50, dropout=0.2):
-        super(RelTemporalEncoding, self).__init__()
+def visualize_energy_distributions(neg_energy_ind, neg_energy_openset, title="Energy Distribution"):
+    """可视化 IND 和 Open-set 节点的能量分布"""
+    neg_energy_ind = neg_energy_ind.detach().cpu().numpy()
+    neg_energy_openset = neg_energy_openset.detach().cpu().numpy()
 
-        position = torch.arange(0.0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, n_hid, 2) * -(math.log(10000.0) / n_hid))
-        emb = nn.Embedding(max_len, n_hid)
-        emb.weight.data[:, 0::2] = torch.sin(position * div_term) / math.sqrt(n_hid)
-        emb.weight.data[:, 1::2] = torch.cos(position * div_term) / math.sqrt(n_hid)
-        emb.requires_grad = False
-        self.emb = emb
-        self.lin = nn.Linear(n_hid, n_hid)
+    plt.figure(figsize=(8, 5))
+    sns.kdeplot(neg_energy_ind, label='Known Classes (IND)', fill=True, color='blue', linewidth=2)
+    sns.kdeplot(neg_energy_openset, label='Unknown Classes (Open-set)', fill=True, color='red', linewidth=2)
+    plt.xlabel("Score (Negative Energy)")
+    plt.ylabel("Density")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
-    def forward(self, x, t):
-        return x + self.lin(self.emb(t))
-
-
-class LinkPredictor(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers, dropout):
-        super(LinkPredictor, self).__init__()
-
-        self.lins = torch.nn.ModuleList()
-        self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
-        for _ in range(num_layers - 2):
-            self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
-        self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
-
-        self.dropout = dropout
-
-    def reset_parameters(self):
-        for lin in self.lins:
-            lin.reset_parameters()
-
-    def forward(self, z, e):
-        x_i = z[e[0]]
-        x_j = z[e[1]]
-        x = torch.cat([x_i, x_j], dim=1)
-        for lin in self.lins[:-1]:
-            x = lin(x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.lins[-1](x)
-        return torch.sigmoid(x).squeeze()
-
-
-class MultiplyPredictor(torch.nn.Module):
-    def __init__(self):
-        super(MultiplyPredictor, self).__init__()
-
-    def forward(self, z, e):
-        x_i = z[e[0]]
-        x_j = z[e[1]]
-        x = (x_i * x_j).sum(dim=1)
-        return torch.sigmoid(x)
-
-
-class SparseInputLinear(nn.Module):
-    def __init__(self, inp_dim, out_dim):
-        super(SparseInputLinear, self).__init__()
-
-        weight = np.zeros((inp_dim, out_dim), dtype=np.float32)
-        weight = nn.Parameter(torch.from_numpy(weight))
-        bias = np.zeros(out_dim, dtype=np.float32)
-        bias = nn.Parameter(torch.from_numpy(bias))
-        self.inp_dim, self.out_dim = inp_dim, out_dim
-        self.weight, self.bias = weight, bias
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        stdv = 1.0 / np.sqrt(self.weight.size(1))
-        self.weight.data.uniform_(-stdv, stdv)
-        self.bias.data.uniform_(-stdv, stdv)
-
-    def forward(self, x):
-        return torch.mm(x, self.weight) + self.bias
 
 
 class DGIBConv(MessagePassing):
@@ -415,30 +360,9 @@ class DGIBNN(torch.nn.Module):
         self.ixz = 0
         self.structure_kl_loss = 0
         self.consensual = 0
-        self.use_RTE = args.use_RTE
-        self.edge_decoder = MultiplyPredictor()
         self.args = args
 
         self.init()
-
-    def time_encoding(self, x_all):
-        n_hid = self.latent_size
-        position = torch.arange(0.0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, n_hid, 2) * -(math.log(10000.0) / n_hid))
-        emb = nn.Embedding(max_len, n_hid)
-        emb.weight.data[:, 0::2] = torch.sin(position * div_term) / math.sqrt(n_hid)
-        emb.weight.data[:, 1::2] = torch.cos(position * div_term) / math.sqrt(n_hid)
-        emb.requires_grad = False
-        self.emb = emb
-        self.lin = nn.Linear(n_hid, n_hid)
-
-        if self.use_RTE:
-            times = len(x_all)
-            for t in range(times):
-                x_all[t] = x_all[t] + self.lin(
-                    self.emb(torch.LongTensor([t]).to(x_all[t].device))
-                )
-        return x_all
 
     def init(self):
         self.reparam_layers = []
@@ -498,7 +422,7 @@ class DGIBNN(torch.nn.Module):
 
     def forward(self, x_all, edge_index_all):
         times = len(x_all)
-        ixz, structure_kl_loss, consensual = [], [], []
+        ixz, structure_kl_loss = [], []
         for i in range(self.num_layers):
             layer = getattr(self, "conv{}".format(i + 1))
             x_all, ixz_mean, structure_kl_loss_mean, ixz_cons = layer(
@@ -506,7 +430,6 @@ class DGIBNN(torch.nn.Module):
             )
             ixz.append(ixz_mean)
             structure_kl_loss.append(structure_kl_loss_mean)
-            consensual.append(ixz_cons)
 
             x_all = [F.elu(x) for x in x_all]
             x_all = [
@@ -519,5 +442,27 @@ class DGIBNN(torch.nn.Module):
             x_all,
             torch.stack(ixz).mean(),
             torch.stack(structure_kl_loss).mean(),
-            torch.stack(consensual).mean(),
         )
+    
+    def detect(self, logits, data, T=1.0):
+        neg_energy = T * torch.logsumexp(logits / T, dim=-1)
+        neg_energy = self.propagation(neg_energy, data.edge_index)
+        ind_idx, openset_idx = data.known_in_unseen_mask, data.unknown_in_unseen_mask
+
+        neg_energy_ind = neg_energy[ind_idx]
+        neg_energy_openset = neg_energy[openset_idx]
+        return neg_energy_ind, neg_energy_openset
+    
+    def propagation(self, e, edge_index, prop_layers=2, alpha=0.5):
+        '''energy belief propagation, return the energy after propagation'''
+        e = e.unsqueeze(1)
+        N = e.shape[0]
+        row, col = edge_index
+        d = degree(col, N).float()
+        d_norm = 1. / d[col]
+        value = torch.ones_like(row) * d_norm
+        value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+        adj = SparseTensor(row=col, col=row, value=value, sparse_sizes=(N, N))
+        for _ in range(prop_layers):
+            e = e * alpha + matmul(adj, e) * (1 - alpha)
+        return e.squeeze(1)

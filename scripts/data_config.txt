@@ -1,0 +1,4 @@
+Cora:
+Known classes: [6, 2, 1, 3]
+Unknown classes: [0, 5, 4]
+label_map {6: 0, 2: 1, 1: 2, 3: 3, 0: 4, 5: 4, 4: 4}

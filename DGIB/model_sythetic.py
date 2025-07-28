@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import math
 from torch_sparse import SparseTensor, matmul
+from tqdm import tqdm
 
 from DGIB.pytorch_net.net import reparameterize, Mixture_Gaussian_reparam
 from DGIB.pytorch_net.util import (
@@ -468,6 +469,59 @@ class DGIBNN(torch.nn.Module):
         return e.squeeze(1)
 
 
+class MLP(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
+                 dropout=.5):
+        super(MLP, self).__init__()
+        self.lins = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        if num_layers == 1:
+            # just linear layer i.e. logistic regression
+            self.lins.append(nn.Linear(in_channels, out_channels))
+        else:
+            self.lins.append(nn.Linear(in_channels, hidden_channels))
+            self.bns.append(nn.BatchNorm1d(hidden_channels))
+            for _ in range(num_layers - 2):
+                self.lins.append(nn.Linear(hidden_channels, hidden_channels))
+                self.bns.append(nn.BatchNorm1d(hidden_channels))
+            self.lins.append(nn.Linear(hidden_channels, out_channels))
+
+        self.dropout = dropout
+
+    def reset_parameters(self):
+        for lin in self.lins:
+            lin.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
+
+    def forward(self, x, edge_index=None):
+        for i, lin in enumerate(self.lins[:-1]):
+            x = lin(x)
+            x = F.relu(x, inplace=True)
+            x = self.bns[i](x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.lins[-1](x)
+        return x
+
+    def intermediate_forward(self, x, edge_index=None, layer_index=None):
+        for i, lin in enumerate(self.lins[:-1]):
+            x = lin(x)
+            x = F.relu(x, inplace=True)
+            x = self.bns[i](x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        return x
+
+    def feature_list(self, x, edge_index=None):
+        out_list = []
+        for i, lin in enumerate(self.lins[:-1]):
+            x = lin(x)
+            x = F.relu(x, inplace=True)
+            x = self.bns[i](x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        out_list.append(x)
+        x = self.lins[-1](x)
+        return x, out_list
+    
 
 class DGIBNN_mlt(torch.nn.Module):
     def __init__(self, args=None):
@@ -484,6 +538,31 @@ class DGIBNN_mlt(torch.nn.Module):
         self.sample_size  = args.sample_size
         self.dropout      = args.dropout
         self.args         = args
+
+        # 生成伪样本超参
+        self.coef_reg       = 1
+        self.mcmc_steps     = 20
+        self.mcmc_step_size = 1
+        self.mcmc_noise     = 0.005
+        self.max_buffer_vol = 2
+        self.buffer_prob = 0.95
+        self.replay_buffer  = None
+        self.p = None
+        self.c = None
+        # 能量网络（采用双线性或 MLP，根据需要）
+        self.energy_net = nn.Sequential(
+            nn.Linear(self.latent_size, self.latent_size),
+            nn.BatchNorm1d(self.latent_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.latent_size, 1)
+        )
+
+        self.d_phi = torch.nn.Sequential(
+            torch.nn.Linear(self.latent_size, self.latent_size//2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.latent_size//2, 1),
+            torch.nn.Sigmoid()
+        )
 
         # 共享第一层
         self.shared_conv = DGIBConv(
@@ -529,31 +608,7 @@ class DGIBNN_mlt(torch.nn.Module):
             val_use_mean=True,
             sample_size=self.sample_size,
         )
-        
-        self.coef_reg       = 1
-        self.mcmc_steps     = 20
-        self.mcmc_step_size = 1
-        self.mcmc_noise     = 0.005
-        self.max_buffer_vol = 2
-        self.buffer_prob = 0.95
-        self.replay_buffer  = None
-        self.p = None
-        self.c = None
-        
-        self.d_phi = torch.nn.Sequential(
-            torch.nn.Linear(self.latent_size, self.latent_size//2),
-            torch.nn.ReLU(),
-            torch.nn.Linear(self.latent_size//2, 1),
-            torch.nn.Sigmoid()
-        )
-        self.energy_net = nn.Sequential(
-            nn.Linear(self.latent_size, self.latent_size),
-            nn.BatchNorm1d(self.latent_size),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.latent_size, 1)
-        )
         self.branch1_cls = nn.Linear(self.latent_size, self.out_size)
-
         # 移动到设备
         self.to(self._get_device())
 
@@ -561,41 +616,32 @@ class DGIBNN_mlt(torch.nn.Module):
         return torch.device(self.args.device)
 
     def forward(self, x_all, edge_index_all):
-        ixz = []
+        ixz_all = []
         structure_kl_loss = []
+
         # 共享层前向
-        x_shared_list, shared_ixz, shared_kl, _ = self.shared_conv(x_all, edge_index_all)
-        x_shared = x_shared_list[0]
-        x_shared = F.elu(x_shared)
-        x_shared = F.dropout(F.normalize(x_shared, dim=-1), p=self.dropout, training=self.training)
-        ixz.append(shared_ixz)
+        x0_list, shared_ixz, shared_kl, _ = self.shared_conv(x_all, edge_index_all)
+        x0 = x0_list[0]
+        x0 = F.elu(x0)
+        x0 = F.dropout(F.normalize(x0, dim=-1), p=self.dropout, training=self.training)
+        ixz_all.append(shared_ixz)
         structure_kl_loss.append(shared_kl)
         # 构造支路输入
-        branch_input = [x_shared]
+        branch_input = [x0]
 
         # 支路1前向
-        x1_list, ixz1, kl1, _ = self.branch1_conv(branch_input, edge_index_all)
+        x1_list, ixz1_mean, kl1, _ = self.branch1_conv(branch_input, edge_index_all)
         x1 = x1_list[0]
         x1 = F.elu(x1)
         x1 = F.dropout(F.normalize(x1, dim=-1), p=self.dropout, training=self.training)
-        ixz.append(ixz1)
+        ixz_all.append(ixz1_mean)
         structure_kl_loss.append(kl1)
-
-        x1 = self.branch1_cls(x1)
-        # 支路2前向
-        # x2_list, ixz2, kl2, _ = self.branch2_conv(branch_input, edge_index_all)
-        # x2 = x2_list[0]
-        # x2 = F.elu(x2)
-        # x2 = F.dropout(F.normalize(x2, dim=-1), p=self.dropout, training=self.training)
-
-        # # 返回每个分支的节点向量及其各自的 ixz_mean, kl_mean
-        # x_branches   = [x1, x2]
-        # ixz_means    = [ixz1, ixz2]
-        # kl_means     = [kl1, kl2]
-        return [x1_list[0]], [x1], torch.stack(ixz).mean(), torch.stack(structure_kl_loss).mean()
-
-
         
+        logits = self.branch1_cls(x1)
+        # x_concat = torch.cat([x0, x1], dim=-1)
+
+        return [x1], [logits], torch.stack(ixz_all).mean(), torch.stack(structure_kl_loss).mean()
+    
     def energy_gradient(self, x):
         self.energy_net.eval()  # 如果你还有 encoder，也加 encoder.eval()
         self.shared_conv.eval()
@@ -606,11 +652,11 @@ class DGIBNN_mlt(torch.nn.Module):
 
         x_i = x.clone().detach().requires_grad_(True)
         x_i = F.elu(x_i)
-        x_i = F.normalize(x_i, dim=-1)
-        logits_neg = self.branch1_cls(x_i)
-        energy_neg = - torch.logsumexp(logits_neg, dim=-1).sum()
+        x_i = F.dropout(F.normalize(x_i, dim=-1), p=0.5, training=True)
+
+        e = self.energy_net(x_i).sum()
         # grad = torch.autograd.grad(e, x_i)[0]
-        grad = torch.autograd.grad(energy_neg, [x_i], retain_graph=True)[0]
+        grad = torch.autograd.grad(e, [x_i], retain_graph=True)[0]
 
         self.energy_net.train()
         self.shared_conv.train()
@@ -618,6 +664,7 @@ class DGIBNN_mlt(torch.nn.Module):
         self.branch2_conv.train()
         self.branch1_cls.train()
         self.d_phi.train()
+
         return grad
 
     def langevin_dynamics_step(self, x_old):
@@ -626,7 +673,7 @@ class DGIBNN_mlt(torch.nn.Module):
         x_new = x_old + self.mcmc_step_size * grad + noise
         return x_new.detach()
 
-    def langevin_dynamics_step_with_weighted_alignment(self, x_old, x_cand, weights_cand, lambda_align=0.1):
+    def langevin_dynamics_step_with_weighted_alignment(self, x_old, x_cand, weights_cand, lambda_align=0.5):
         grad = self.energy_gradient(x_old)  # [B, D]
         noise = torch.randn_like(x_old) * self.mcmc_noise  # [B, D]
 
@@ -708,8 +755,8 @@ class DGIBNN_mlt(torch.nn.Module):
     def pu_discriminator_loss(self, x_labeled, x_unlabeled, mu=0.5, reduction='mean'):
         d_phi = self.d_phi
 
-        out_pos = torch.clamp(d_phi(x_labeled.detach()), 1e-6, 1 - 1e-6)
-        out_unl = torch.clamp(d_phi(x_unlabeled.detach()), 1e-6, 1 - 1e-6)
+        out_pos = torch.clamp(d_phi(x_labeled), 1e-6, 1 - 1e-6)
+        out_unl = torch.clamp(d_phi(x_unlabeled), 1e-6, 1 - 1e-6)
 
         loss_pos_1 = F.binary_cross_entropy(out_pos, torch.ones_like(out_pos), reduction='none')
         loss_pos_0 = F.binary_cross_entropy(out_pos, torch.zeros_like(out_pos), reduction='none')
@@ -723,19 +770,6 @@ class DGIBNN_mlt(torch.nn.Module):
             raise ValueError("reduction must be 'mean' or 'sum'")
 
         return pu_loss
-
-    def loss_uncertainty_softmargin(self, energy_id, energy_ood, margin=0.0, tau=1,
-                                squared=False, reduction='mean'):
-        # 惩罚 ID 能量 > margin，以及 OOD 能量 < margin
-        pos = F.softplus((energy_id - margin) / tau)       # 平滑替代 relu(energy_id - margin)
-        neg = F.softplus((margin - energy_ood) / tau)      # 平滑替代 relu(margin - energy_ood)
-
-        if squared:
-            pos = pos ** 2
-            neg = neg ** 2
-
-        loss = pos + neg
-        return loss.mean() if reduction == 'mean' else loss.sum()
 
     def compute_openset_weight(self, d_probs, mu=0.5):
         """
@@ -780,14 +814,17 @@ class DGIBNN_mlt(torch.nn.Module):
         mask_cand = torch.zeros_like(weights, dtype=torch.bool)
         mask_cand[unlabeled_mask] = weights_unlabeled >= thresh
         return mask_cand.view(-1)
-    
-    def detect_energy_head(self, e, data, T=1.0, cos_threshold=-1, prop_layers=2, alpha=0.5):
+
+
+    def detect(self, e, data, T=1.0, cos_threshold=-1, prop_layers=2, alpha=0.5):
         """
         基于余弦相似度剪枝邻接后，再进行能量传播。
         cos_threshold: 保留余弦相似度大于该值的边
         """
+        # 1. 初始能量
+        # e = T * torch.logsumexp(logits / T, dim=-1)
 
-        # 3. 传播
+        # # 3. 传播
         # e = self.propagation(e, data.edge_index,
         #                      prop_layers=prop_layers, alpha=alpha)
 
@@ -797,7 +834,7 @@ class DGIBNN_mlt(torch.nn.Module):
         neg_energy_openset = e[openset_idx]
         return neg_energy_ind, neg_energy_openset
     
-    def detect(self, logits, data, T=1.0, cos_threshold=-1, prop_layers=2, alpha=0.5):
+    def detect_logit(self, logits, data, T=1.0, cos_threshold=-1, prop_layers=2, alpha=0.5):
         """
         基于余弦相似度剪枝邻接后，再进行能量传播。
         cos_threshold: 保留余弦相似度大于该值的边
@@ -805,21 +842,8 @@ class DGIBNN_mlt(torch.nn.Module):
         # 1. 初始能量
         e = T * torch.logsumexp(logits / T, dim=-1)
 
-        # 2. 基于余弦相似度剪枝邻接
-        #    获取节点特征（这里用 logits 作 embedding）
-        embeddings = logits  # [N, C]
-        row, col = data.edge_index
-        # 仅一阶边：逐边计算余弦相似度
-        h_row = embeddings[row]  # [E, C]
-        h_col = embeddings[col]  # [E, C]
-        cos_sim = F.cosine_similarity(h_row, h_col, dim=-1)  # [E]
-        mask = cos_sim >= cos_threshold
-        # 构造剪枝后的 edge_index
-        pruned_row = row[mask]
-        pruned_col = col[mask]
-
         # 3. 传播
-        e = self.propagation(e, (pruned_row, pruned_col),
+        e = self.propagation(e, data.edge_index,
                              prop_layers=prop_layers, alpha=alpha)
 
         # 4. 拆分 ID 与 openset
@@ -827,7 +851,7 @@ class DGIBNN_mlt(torch.nn.Module):
         neg_energy_ind = e[ind_idx]
         neg_energy_openset = e[openset_idx]
         return neg_energy_ind, neg_energy_openset
-
+    
     def propagation(self, e, edge_index, prop_layers=2, alpha=0.5):
         """能量传播，返回传播后的标量能量 e"""
         # e: [N]
@@ -841,4 +865,92 @@ class DGIBNN_mlt(torch.nn.Module):
         for _ in range(prop_layers):
             e = e * alpha + matmul(adj, e) * (1 - alpha)
         return e.squeeze(1)
+
+
+import torch
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+
+def visualize_embeddings_tsne(z_all, z_sample, data, title="t-SNE Visualization of Embeddings"):
+    """
+    可视化表征：训练ID、测试ID、测试OOD 和 伪OOD采样。
+
+    参数:
+        z_all: torch.Tensor, 所有节点的嵌入表示（来自 encoder 输出）
+        z_sample: torch.Tensor, 采样生成的伪OOD嵌入
+        data: PyG 数据对象，需包含 train_mask、known_in_unseen_mask、unknown_in_unseen_mask 掩码
+        title: str, 图标题
+    """
+    z_id_train = z_all[data.train_mask].detach().cpu()
+    z_id_test = z_all[data.known_in_unseen_mask].detach().cpu()
+    z_ood_test = z_all[data.unknown_in_unseen_mask].detach().cpu()
+    z_fake_ood = z_sample.detach().cpu()
+
+    z_all_vis = torch.cat([z_id_train, z_id_test, z_ood_test, z_fake_ood], dim=0)
+    labels = (
+        ['Train ID'] * len(z_id_train) +
+        ['Test Known ID'] * len(z_id_test) +
+        ['Test Unknown OOD'] * len(z_ood_test) +
+        ['Fake OOD (Sample)'] * len(z_fake_ood)
+    )
+
+    tsne = TSNE(n_components=2, random_state=42)
+    z_tsne = tsne.fit_transform(z_all_vis.numpy())
+
+    plt.figure(figsize=(8, 6))
+    colors = {
+        'Train ID': 'green',
+        'Test Known ID': 'blue',
+        'Test Unknown OOD': 'red',
+        'Fake OOD (Sample)': 'black'
+    }
+
+    for label in set(labels):
+        idx = [i for i, l in enumerate(labels) if l == label]
+        plt.scatter(z_tsne[idx, 0], z_tsne[idx, 1], s=20, label=label, alpha=0.6, c=colors[label])
+
+    plt.legend()
+    plt.title(title)
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def visualize_energy_distributions(
+    energy_ind: torch.Tensor,
+    energy_sample: torch.Tensor,
+    title: str = "Energy Distribution",
+    save_path: str = None,
+    bins: int = 50
+):
+    """
+    可视化 ID 和伪 OOD 样本的能量分布（直方图 + KDE）。
+
+    参数:
+        energy_ind: [N] 张量，训练集中 ID 节点的能量
+        energy_sample: [M] 张量，伪 OOD 节点的能量
+        title: 图标题
+        save_path: 如果提供路径则保存为图片，否则直接展示
+        bins: 直方图 bin 数量
+    """
+    energy_ind = energy_ind.detach().cpu().numpy()
+    energy_sample = energy_sample.detach().cpu().numpy()
+
+    plt.figure(figsize=(8, 5))
+    sns.histplot(energy_ind, bins=bins, kde=True, stat='density',
+                 label="Train (ID)", color='green', alpha=0.6)
+    sns.histplot(energy_sample, bins=bins, kde=True, stat='density',
+                 label="Sampled (pseudo OOD)", color='red', alpha=0.6)
     
+    plt.xlabel("Energy")
+    plt.ylabel("Density")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()

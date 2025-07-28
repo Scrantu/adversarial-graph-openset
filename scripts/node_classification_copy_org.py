@@ -288,7 +288,7 @@ def main():
     parser.add_argument('--heads', type=int, default=1, help='Attention heads')
     parser.add_argument('--reparam_mode', type=str, default='diag', help='Reparameterization mode for XIB. Choose from "None", "diag" or "full"')
     parser.add_argument('--prior_mode', type=str, default='Gaussian', help='Prior mode. Choose from "Gaussian" or "mixGau-10" (mixture of 10 Gaussian components)')
-    parser.add_argument('--distribution', type=str, default='categorical', help="categorical,Bernoulli")
+    parser.add_argument('--distribution', type=str, default='Bernoulli', help="categorical,Bernoulli")
     parser.add_argument('--temperature', type=float, default=1, help='Sampling temperature')
     parser.add_argument('--nbsz', type=int, default=20, help='Neighbor sample size')
     parser.add_argument('--sample_size', type=int, default=50, help='Reparameterize samples')

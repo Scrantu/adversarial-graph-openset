@@ -15,7 +15,7 @@ sys.path.append('./')
 sys.path.append('../')
 sys.path.append('../../')
 sys.path.append('../../../')
-from DGIB.model import DGIBNN,DGIBNN_mlt,visualize_embeddings_tsne
+from DGIB.model_sythetic import DGIBNN,DGIBNN_mlt,visualize_embeddings_tsne
 from tqdm import tqdm
 import os
 from sklearn.model_selection import train_test_split

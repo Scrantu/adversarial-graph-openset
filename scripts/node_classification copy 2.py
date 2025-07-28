@@ -15,7 +15,7 @@ sys.path.append('./')
 sys.path.append('../')
 sys.path.append('../../')
 sys.path.append('../../../')
-from DGIB.model import DGIBNN,DGIBNN_mlt
+from DGIB.model_sythetic import DGIBNN,DGIBNN_mlt
 from tqdm import tqdm
 import os
 from sklearn.model_selection import train_test_split
@@ -598,14 +598,14 @@ def main():
     plt.savefig("id_vs_ood_performance.png")
     plt.show()
 
-    model.load_state_dict(best_model_state)
-    # Training loop
-    for epoch in tqdm(range(1, args.epochs + 1)):
-        loss = train_openset(model, data, optimizer, device, args, epoch)
-        accs = test(model, data, device)
-        if epoch == 1 or epoch % 10 == 0:
-            print(f"Epoch {epoch:03d} | Loss: {loss:.4f} | Train: {accs['train']:.4f} "  
-                f"| Val: {accs['val']:.4f} | Overall Test: {accs['test']:.4f} | Known in Test: {accs['known_in_unseen']:.4f} | Openset detection: {accs['openset']}")
+    # model.load_state_dict(best_model_state)
+    # # Training loop
+    # for epoch in tqdm(range(1, args.epochs + 1)):
+    #     loss = train_openset(model, data, optimizer, device, args, epoch)
+    #     accs = test(model, data, device)
+    #     if epoch == 1 or epoch % 10 == 0:
+    #         print(f"Epoch {epoch:03d} | Loss: {loss:.4f} | Train: {accs['train']:.4f} "  
+    #             f"| Val: {accs['val']:.4f} | Overall Test: {accs['test']:.4f} | Known in Test: {accs['known_in_unseen']:.4f} | Openset detection: {accs['openset']}")
 
 
 

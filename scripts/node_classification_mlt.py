@@ -266,7 +266,8 @@ def train(model, data, optimizer, device, args, epoch):
             device=args.device
         )
 
-
+    z_sample = F.elu(z_sample)
+    z_sample = F.dropout(F.normalize(z_sample, dim=-1), p=0.5, training=True)
     energy_sample = model.energy_net(z_sample).squeeze()
     # print('energy_sample', energy_sample, len(energy_sample))
     # loss_openset = model.gen_loss(energy_ind, energy_sample)
@@ -284,8 +285,8 @@ def train(model, data, optimizer, device, args, epoch):
     if epoch > 50:
         # for param in model.shared_conv.parameters():
         #         param.requires_grad = False
-        for param in model.branch1_conv.parameters():
-                param.requires_grad = False
+        # for param in model.branch1_conv.parameters():
+        #         param.requires_grad = False
         loss = loss + 0.001 * ixz_loss_2 \
                + 0.001 * struct_kl_loss_2 \
                + (loss_cls_openset + 1*loss_openset)

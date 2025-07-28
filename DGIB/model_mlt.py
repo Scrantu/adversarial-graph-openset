@@ -653,10 +653,11 @@ class DGIBNN_mlt(torch.nn.Module):
         self.shared_conv.eval()
         self.branch1_conv.eval()
         self.branch2_conv.eval()
+        self.branch2_cls.eval()
 
 
         x_i = x.clone().detach().requires_grad_(True)
-        e = -self.energy_net(x_i).sum()
+        e = self.energy_net(x_i).sum()
         # grad = torch.autograd.grad(e, x_i)[0]
         grad = torch.autograd.grad(e, [x_i], retain_graph=True)[0]
 
@@ -664,6 +665,7 @@ class DGIBNN_mlt(torch.nn.Module):
         self.shared_conv.train()
         self.branch1_conv.train()
         self.branch2_conv.train()
+        self.branch2_cls.train()
 
         return grad
 

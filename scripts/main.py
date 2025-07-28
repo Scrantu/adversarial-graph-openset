@@ -21,7 +21,7 @@ info_dict = get_arg_dict(args)
 
 # Runner
 from DGIB.runner import Runner
-from DGIB.model import DGIBNN
+from DGIB.model_sythetic import DGIBNN
 
 model = DGIBNN(args=args).to(args.device)
 runner = Runner(args, model, data)

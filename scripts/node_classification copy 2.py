@@ -15,7 +15,7 @@ sys.path.append('./')
 sys.path.append('../')
 sys.path.append('../../')
 sys.path.append('../../../')
-from DGIB.model import DGIBNN,DGIBNN_mlt,visualize_embeddings_tsne
+from DGIB.model import DGIBNN,DGIBNN_mlt
 from tqdm import tqdm
 import os
 from sklearn.model_selection import train_test_split
@@ -30,8 +30,6 @@ import numpy as np
 from torch_geometric.data import Data
 import random
 import copy
-from sklearn.manifold import TSNE
-
 
 seed = 0
 random.seed(seed)
@@ -294,7 +292,7 @@ def train_openset(model, data, optimizer, device, args, epoch, warm_up_epoch=60)
         mask_cand = model.select_topk_ood_candidates(weights_all, mu, data.test_mask).detach()
 
     # Combine with DGIB losses
-    loss = (loss_cls \
+    loss = 0.0*(loss_cls \
            + args.lambda_ixz * ixz_loss \
            + args.lambda_struct * struct_kl_loss \
            + 0.1*loss_pu)
@@ -393,14 +391,14 @@ def train(model, data, optimizer, device, args, epoch, warm_up_epoch=60):
     if epoch <= warm_up_epoch:
         loss = loss + 0.1*loss_pu
     
-    if epoch > 100:
+    if epoch > warm_up_epoch:
         # --------------------------- 伪 OOD 对齐（加权版本） ---------------------------
         model.d_phi.eval()
         z_pos_hid = embeddings_list[0]  # 假设第一个分支输出是 ID 嵌入
         z_pos = F.elu(z_pos_hid)
         z_pos = F.dropout(F.normalize(z_pos, dim=-1), p=0.5, training=True)
-        energy_ind = model.energy_net(z_pos_hid[data.train_mask]).squeeze()
-        # print('energy_ind', energy_ind)
+        energy_ind = - model.energy_net(z_pos_hid[data.train_mask]).squeeze()
+
         z_all = embeddings_list[0]
         z_cand = z_all[mask_cand]
         weights_cand = weights_all[mask_cand].detach()
@@ -411,28 +409,10 @@ def train(model, data, optimizer, device, args, epoch, warm_up_epoch=60):
             x_cand=z_cand,  # 加入候选伪OOD
             weights_cand=weights_cand
         )
-        energy_sample = model.energy_net(z_sample).squeeze()
-
-        if epoch % 10 == 0:
-            visualize_embeddings_tsne(z_all, z_sample, data)
-
-        # print('energy_sample', energy_sample)
-        # loss_id = F.softplus(-energy_ind)     # log(1 + exp(-E(x)))
-        # loss_ood = F.softplus(energy_sample)    # log(1 + exp(E(v)))
-        # loss_openset = loss_id.mean() + loss_ood.mean()
-        energy_all = - torch.cat([energy_ind, energy_sample], dim=0)  # [N_id + N_ood]
-        target = torch.cat([
-            torch.ones_like(energy_ind),   # ID label = 1
-            torch.zeros_like(energy_sample)  # OOD label = 0
-        ], dim=0)
-
-        # BCE loss（等价于 Eq. (5)）
-        loss_uncertainty = F.binary_cross_entropy_with_logits(energy_all, target)
-
-        # loss_openset = torch.mean(F.relu(energy_ind - 0) ** 2 + F.relu(0 - energy_sample) ** 2)
-        loss = loss + 0.1*loss_uncertainty 
-        # loss = loss + 0.1*(loss_openset)
-
+        energy_sample = - model.energy_net(z_sample).squeeze()
+        loss_openset = torch.mean(F.relu(energy_ind - 0) ** 2 + F.relu(0 - energy_sample) ** 2)
+        loss = loss_openset
+           
     
     loss.backward()
     optimizer.step()
@@ -457,7 +437,7 @@ def test(model, data, device):
     
     z = embeddings_list[0]
     # 计算能量得分
-    e = - model.energy_net(z).squeeze()
+    e = model.energy_net(z).squeeze()
     # e = -e
     test_ind_score, test_openset_score = model.detect(e.to(device), data.to(device))
     auroc, aupr, fpr, _ = get_measures(test_ind_score.cpu(), test_openset_score.cpu())
@@ -475,7 +455,7 @@ def main():
     parser.add_argument('--heads', type=int, default=1, help='Attention heads')
     parser.add_argument('--reparam_mode', type=str, default='diag', help='Reparameterization mode for XIB. Choose from "None", "diag" or "full"')
     parser.add_argument('--prior_mode', type=str, default='Gaussian', help='Prior mode. Choose from "Gaussian" or "mixGau-10" (mixture of 10 Gaussian components)')
-    parser.add_argument('--distribution', type=str, default='categorical', help="categorical,Bernoulli")
+    parser.add_argument('--distribution', type=str, default='Bernoulli', help="categorical,Bernoulli")
     parser.add_argument('--temperature', type=float, default=1, help='Sampling temperature')
     parser.add_argument('--nbsz', type=int, default=20, help='Neighbor sample size')
     parser.add_argument('--sample_size', type=int, default=50, help='Reparameterize samples')
@@ -493,7 +473,7 @@ def main():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device (cuda or cpu)')
     parser.add_argument('--save_path', type=str, default='model.pth', help='Saved model')
-    parser.add_argument('--dataset', type=str, default='cora', help='data name')
+    parser.add_argument('--dataset', type=str, default='citeseer', help='data name')
 
     args = parser.parse_args()
 
@@ -564,8 +544,8 @@ def main():
     ood_auroc_list = [] 
     # Training loop
     for epoch in tqdm(range(1, args.epochs + 1)):
-        loss = train(model, data, optimizer, device, args, epoch)
-        # loss = train_openset(model, data, optimizer, device, args, epoch)
+        loss = train_warmup(model, data, optimizer, device, args, epoch)
+        loss = train_openset(model, data, optimizer, device, args, epoch)
         accs = test(model, data, device)
         if accs['val'] > best_val:
             best_val = accs['val']
@@ -578,7 +558,7 @@ def main():
             #             'optimizer_state_dict': optimizer.state_dict(),
             #             'val_acc': best_val
             #             }, args.save_path)
-            # best_model_state = copy.deepcopy(model.state_dict())
+            best_model_state = copy.deepcopy(model.state_dict())
         else:
             patience_counter += 1
 
@@ -618,14 +598,14 @@ def main():
     plt.savefig("id_vs_ood_performance.png")
     plt.show()
 
-    # model.load_state_dict(best_model_state)
-    # # Training loop
-    # for epoch in tqdm(range(1, args.epochs + 1)):
-    #     loss = train_openset(model, data, optimizer, device, args, epoch)
-    #     accs = test(model, data, device)
-    #     if epoch == 1 or epoch % 10 == 0:
-    #         print(f"Epoch {epoch:03d} | Loss: {loss:.4f} | Train: {accs['train']:.4f} "  
-    #             f"| Val: {accs['val']:.4f} | Overall Test: {accs['test']:.4f} | Known in Test: {accs['known_in_unseen']:.4f} | Openset detection: {accs['openset']}")
+    model.load_state_dict(best_model_state)
+    # Training loop
+    for epoch in tqdm(range(1, args.epochs + 1)):
+        loss = train_openset(model, data, optimizer, device, args, epoch)
+        accs = test(model, data, device)
+        if epoch == 1 or epoch % 10 == 0:
+            print(f"Epoch {epoch:03d} | Loss: {loss:.4f} | Train: {accs['train']:.4f} "  
+                f"| Val: {accs['val']:.4f} | Overall Test: {accs['test']:.4f} | Known in Test: {accs['known_in_unseen']:.4f} | Openset detection: {accs['openset']}")
 
 
 

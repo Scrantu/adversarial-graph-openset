@@ -1,0 +1,14 @@
+
+experimentName: gcn_nni
+trialConcurrency: 2
+maxTrialNumber: 20
+maxExperimentDuration: 1h
+
+searchSpaceFile: search_space.json
+trialCommand: python3 gcn_nni_train.py
+trialCodeDirectory: .
+
+tuner:
+  name: TPE
+  classArgs:
+    optimize_mode: maximize

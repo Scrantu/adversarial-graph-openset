@@ -21,7 +21,6 @@ import numpy as np
 import torch
 import math
 from torch_sparse import SparseTensor, matmul
-from tqdm import tqdm
 
 from DGIB.pytorch_net.net import reparameterize, Mixture_Gaussian_reparam
 from DGIB.pytorch_net.util import (
@@ -469,59 +468,6 @@ class DGIBNN(torch.nn.Module):
         return e.squeeze(1)
 
 
-class MLP(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers,
-                 dropout=.5):
-        super(MLP, self).__init__()
-        self.lins = nn.ModuleList()
-        self.bns = nn.ModuleList()
-        if num_layers == 1:
-            # just linear layer i.e. logistic regression
-            self.lins.append(nn.Linear(in_channels, out_channels))
-        else:
-            self.lins.append(nn.Linear(in_channels, hidden_channels))
-            self.bns.append(nn.BatchNorm1d(hidden_channels))
-            for _ in range(num_layers - 2):
-                self.lins.append(nn.Linear(hidden_channels, hidden_channels))
-                self.bns.append(nn.BatchNorm1d(hidden_channels))
-            self.lins.append(nn.Linear(hidden_channels, out_channels))
-
-        self.dropout = dropout
-
-    def reset_parameters(self):
-        for lin in self.lins:
-            lin.reset_parameters()
-        for bn in self.bns:
-            bn.reset_parameters()
-
-    def forward(self, x, edge_index=None):
-        for i, lin in enumerate(self.lins[:-1]):
-            x = lin(x)
-            x = F.relu(x, inplace=True)
-            x = self.bns[i](x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.lins[-1](x)
-        return x
-
-    def intermediate_forward(self, x, edge_index=None, layer_index=None):
-        for i, lin in enumerate(self.lins[:-1]):
-            x = lin(x)
-            x = F.relu(x, inplace=True)
-            x = self.bns[i](x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        return x
-
-    def feature_list(self, x, edge_index=None):
-        out_list = []
-        for i, lin in enumerate(self.lins[:-1]):
-            x = lin(x)
-            x = F.relu(x, inplace=True)
-            x = self.bns[i](x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        out_list.append(x)
-        x = self.lins[-1](x)
-        return x, out_list
-    
 
 class DGIBNN_mlt(torch.nn.Module):
     def __init__(self, args=None):
@@ -538,31 +484,6 @@ class DGIBNN_mlt(torch.nn.Module):
         self.sample_size  = args.sample_size
         self.dropout      = args.dropout
         self.args         = args
-
-        # 生成伪样本超参
-        self.coef_reg       = 1
-        self.mcmc_steps     = 20
-        self.mcmc_step_size = 1
-        self.mcmc_noise     = 0.005
-        self.max_buffer_vol = 2
-        self.buffer_prob = 0.95
-        self.replay_buffer  = None
-        self.p = None
-        self.c = None
-        # 能量网络（采用双线性或 MLP，根据需要）
-        self.energy_net = nn.Sequential(
-            nn.Linear(self.latent_size, self.latent_size),
-            nn.BatchNorm1d(self.latent_size),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.latent_size, 1)
-        )
-
-        self.d_phi = torch.nn.Sequential(
-            torch.nn.Linear(self.latent_size, self.latent_size//2),
-            torch.nn.ReLU(),
-            torch.nn.Linear(self.latent_size//2, 1),
-            torch.nn.Sigmoid()
-        )
 
         # 共享第一层
         self.shared_conv = DGIBConv(
@@ -582,7 +503,7 @@ class DGIBNN_mlt(torch.nn.Module):
         # 支路1第二层
         self.branch1_conv = DGIBConv(
             in_channels=self.latent_size,
-            out_channels=self.latent_size,
+            out_channels=self.out_size,
             heads=1,
             concat=True,
             reparam_mode=self.reparam_mode,
@@ -597,7 +518,7 @@ class DGIBNN_mlt(torch.nn.Module):
         # 支路2第二层
         self.branch2_conv = DGIBConv(
             in_channels=self.latent_size,
-            out_channels=self.latent_size,
+            out_channels=self.out_size,
             heads=1,
             concat=True,
             reparam_mode=self.reparam_mode,
@@ -608,7 +529,7 @@ class DGIBNN_mlt(torch.nn.Module):
             val_use_mean=True,
             sample_size=self.sample_size,
         )
-        self.branch1_cls = nn.Linear(self.latent_size, self.out_size)
+
         # 移动到设备
         self.to(self._get_device())
 
@@ -616,237 +537,63 @@ class DGIBNN_mlt(torch.nn.Module):
         return torch.device(self.args.device)
 
     def forward(self, x_all, edge_index_all):
-        ixz_all = []
+        ixz = []
         structure_kl_loss = []
-
         # 共享层前向
-        x0_list, shared_ixz, shared_kl, _ = self.shared_conv(x_all, edge_index_all)
-        x0 = x0_list[0]
-        x0 = F.elu(x0)
-        x0 = F.dropout(F.normalize(x0, dim=-1), p=self.dropout, training=self.training)
-        ixz_all.append(shared_ixz)
+        x_shared_list, shared_ixz, shared_kl, _ = self.shared_conv(x_all, edge_index_all)
+        x_shared = x_shared_list[0]
+        x_shared = F.elu(x_shared)
+        x_shared = F.dropout(F.normalize(x_shared, dim=-1), p=self.dropout, training=self.training)
+        ixz.append(shared_ixz)
         structure_kl_loss.append(shared_kl)
         # 构造支路输入
-        branch_input = [x0]
+        branch_input = [x_shared]
 
         # 支路1前向
-        x1_list, ixz1_mean, kl1, _ = self.branch1_conv(branch_input, edge_index_all)
+        x1_list, ixz1, kl1, _ = self.branch1_conv(branch_input, edge_index_all)
         x1 = x1_list[0]
         x1 = F.elu(x1)
         x1 = F.dropout(F.normalize(x1, dim=-1), p=self.dropout, training=self.training)
-        ixz_all.append(ixz1_mean)
+        ixz.append(ixz1)
         structure_kl_loss.append(kl1)
 
-        # x_concat = torch.cat([x0, x1], dim=-1)
+        # 支路2前向
+        # x2_list, ixz2, kl2, _ = self.branch2_conv(branch_input, edge_index_all)
+        # x2 = x2_list[0]
+        # x2 = F.elu(x2)
+        # x2 = F.dropout(F.normalize(x2, dim=-1), p=self.dropout, training=self.training)
 
-        return [x1], torch.stack(ixz_all).mean(), torch.stack(structure_kl_loss).mean()
-    
-    def energy_gradient(self, x):
-        self.energy_net.eval()  # 如果你还有 encoder，也加 encoder.eval()
-        self.shared_conv.eval()
-        self.branch1_conv.eval()
-        self.branch2_conv.eval()
-
-
-        x_i = x.clone().detach().requires_grad_(True)
-        e = -self.energy_net(x_i).sum()
-        # grad = torch.autograd.grad(e, x_i)[0]
-        grad = torch.autograd.grad(e, [x_i], retain_graph=True)[0]
-
-        self.energy_net.train()
-        self.shared_conv.train()
-        self.branch1_conv.train()
-        self.branch2_conv.train()
-
-        return grad
-
-    def langevin_dynamics_step(self, x_old):
-        grad = self.energy_gradient(x_old)
-        noise = torch.randn_like(grad) * self.mcmc_noise
-        x_new = x_old + self.mcmc_step_size * grad + noise
-        return x_new.detach()
-
-    def langevin_dynamics_step_with_weighted_alignment(self, x_old, x_cand, weights_cand, lambda_align=0.5):
-        grad = self.energy_gradient(x_old)  # ∇ E(x)
-        noise = torch.randn_like(x_old) * self.mcmc_noise
-
-        # 对齐项: 加权均值对齐 ( ∑ w_i x_i - x_old )
-        if x_cand is not None and x_cand.size(0) > 0:
-            weights_cand = weights_cand.view(-1, 1)  # [N, 1]
-            x_weighted_mean = (x_cand * weights_cand).sum(dim=0) / weights_cand.sum()  # [D]
-            align_term = x_weighted_mean.unsqueeze(0) - x_old  # [B, D]
-        else:
-            align_term = 0.0
-
-        # Langevin + 对齐合成
-        x_new = lambda_align * (x_old - 0.5 * self.mcmc_step_size * grad + noise) \
-                + (1 - lambda_align) * align_term
-        return x_new.detach()
+        # # 返回每个分支的节点向量及其各自的 ixz_mean, kl_mean
+        # x_branches   = [x1, x2]
+        # ixz_means    = [ixz1, ixz2]
+        # kl_means     = [kl1, kl2]
+        return [x1], torch.stack(ixz).mean(), torch.stack(structure_kl_loss).mean()
 
 
-    def sample(self, sample_size, max_buffer_len, device, x_cand=None, weights_cand=None):
-        if self.replay_buffer is None:
-            x = 2.0 * torch.rand(sample_size, self.latent_size, device=device) - 1.0
-        else:
-            idx = torch.randperm(self.replay_buffer.size(0))[:int(sample_size * self.buffer_prob)]
-            x = torch.cat([
-                self.replay_buffer[idx],
-                2.0 * torch.rand(sample_size - idx.size(0), self.latent_size, device=device) - 1.0
-            ], dim=0)
-
-        for _ in range(self.mcmc_steps):
-            x = self.langevin_dynamics_step_with_weighted_alignment(
-                x.to(device), x_cand=x_cand, weights_cand=weights_cand
-            )
-
-        if self.replay_buffer is None:
-            self.replay_buffer = x
-        else:
-            self.replay_buffer = torch.cat([x, self.replay_buffer], dim=0)[:max_buffer_len]
-
-        return x
-
-
-    # def sample(self, sample_size, max_buffer_len, device):
-    #     # 初始化或从缓冲区采样
-    #     if self.replay_buffer is None:
-    #         x = 2.0 * torch.rand(sample_size, self.latent_size, device=device) - 1.0
-    #     else:
-    #         idx = torch.randperm(self.replay_buffer.size(0))[:int(sample_size * self.buffer_prob)]
-    #         x = torch.cat([
-    #             self.replay_buffer[idx],
-    #             2.0 * torch.rand(sample_size - idx.size(0), self.latent_size, device=device) - 1.0
-    #         ], dim=0)
-    #     # MCMC 采样
-    #     for _ in range(self.mcmc_steps):
-    #         x = self.langevin_dynamics_step(x.to(device))
-    #     # 更新缓冲区
-    #     if self.replay_buffer is None:
-    #         self.replay_buffer = x
-    #     else:
-    #         self.replay_buffer = torch.cat([x, self.replay_buffer], dim=0)[:max_buffer_len]
-    #     return x
-
-    def gen_loss(self, energy_pos, energy_neg, reduction='mean'):
-        # 生成损失: 拉开正（ID）与伪（sample）能量
-        loss = energy_pos - energy_neg
-        loss_reg = energy_pos.pow(2) + energy_neg.pow(2)
-        loss = loss + self.coef_reg * loss_reg
-        if reduction == 'mean':
-            return loss.mean()
-        elif reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
-
-    def loss_push_openset(self, data):
-        # 前向，拿到 ID 嵌入与能量
-        _, x_branches, _, _, _, _, _, _ = self.forward(data.x, data.edge_index)
-        z_pos = x_branches[0]  # 假设第一个分支输出是 ID 嵌入
-        energy_ind = self.energy_net(z_pos).squeeze()
-
-        # 采样伪嵌入并计算能量
-        z_sample = self.sample(
-            sample_size=self.sample_size,
-            max_buffer_len=int(self.max_buffer_vol * self.sample_size),
-            device=data.x.device
-        )
-        energy_sample = self.energy_net(z_sample).squeeze()
-
-        # 生成损失
-        loss_openset = self.gen_loss(energy_ind, energy_sample)
-
-
-        return loss_openset
-
-    def pu_discriminator_loss(self, x_labeled, x_unlabeled, mu=0.5, reduction='mean'):
-        d_phi = self.d_phi
-
-        out_pos = torch.clamp(d_phi(x_labeled), 1e-6, 1 - 1e-6)
-        out_unl = torch.clamp(d_phi(x_unlabeled), 1e-6, 1 - 1e-6)
-
-        loss_pos_1 = F.binary_cross_entropy(out_pos, torch.ones_like(out_pos), reduction='none')
-        loss_pos_0 = F.binary_cross_entropy(out_pos, torch.zeros_like(out_pos), reduction='none')
-        loss_unl_0 = F.binary_cross_entropy(out_unl, torch.zeros_like(out_unl), reduction='none')
-
-        if reduction == 'mean':
-            pu_loss = mu * loss_pos_1.mean() - mu * loss_pos_0.mean() + loss_unl_0.mean()
-        elif reduction == 'sum':
-            pu_loss = mu * loss_pos_1.sum() - mu * loss_pos_0.sum() + loss_unl_0.sum()
-        else:
-            raise ValueError("reduction must be 'mean' or 'sum'")
-
-        return pu_loss
-
-    def compute_openset_weight(self, d_probs, mu=0.5):
-        """
-        输入:
-            d_probs: 判别器输出 d(x)，应在 [0,1]，表示为 ID 的概率
-            mu: unlabeled 样本中 ID 样本的先验比例（如 0.3）
-
-        输出:
-            w_ood: 每个样本属于 OOD 的重要性权重
-        """
-        d = torch.clamp(d_probs, min=1e-6, max=1-1e-6)  # 避免除0
-        numerator = d
-        denominator = mu * d + (1 - mu) * (1 - d)
-        w_id = numerator / denominator
-        w_ood = 1.0 - w_id
-        return w_ood
-
-    def select_topk_ood_candidates(self, weights: torch.Tensor, mu: float, unlabeled_mask: torch.Tensor) -> torch.Tensor:
-        """
-        选择 unlabeled 中 OOD 权重 Top-(1 - mu) 的节点索引（Bool Mask）
-
-        参数:
-            weights: [N]，全图节点的 OOD 权重
-            mu: 正类比例
-            unlabeled_mask: [N]，布尔张量，True 表示 unlabeled 节点
-
-        返回:
-            mask_cand: [N]，布尔张量，True 表示选中的伪 OOD 节点
-        """
-        weights_unlabeled = weights[unlabeled_mask]  # 提取 unlabeled 部分
-        N_unl = weights_unlabeled.size(0)
-        k = int((1 - mu) * N_unl)
-
-        if k == 0 or N_unl == 0:
-            return torch.zeros_like(weights, dtype=torch.bool)  # 返回全 False
-
-        # 获取阈值
-        sorted_weights, _ = torch.sort(weights_unlabeled, descending=True)
-        thresh = sorted_weights[k - 1].item()
-
-        # 构造原始空间上的 mask
-        mask_cand = torch.zeros_like(weights, dtype=torch.bool)
-        mask_cand[unlabeled_mask] = weights_unlabeled >= thresh
-        return mask_cand.view(-1)
-
-
-    def detect(self, e, data, T=1.0, cos_threshold=-1, prop_layers=2, alpha=0.5):
+    def detect(self, logits, data, T=1.0, cos_threshold=-1, prop_layers=2, alpha=0.5):
         """
         基于余弦相似度剪枝邻接后，再进行能量传播。
         cos_threshold: 保留余弦相似度大于该值的边
         """
-        # # 1. 初始能量
-        # neg_energy = T * torch.logsumexp(logits / T, dim=-1)
+        # 1. 初始能量
+        neg_energy = T * torch.logsumexp(logits / T, dim=-1)
 
-        # # 2. 基于余弦相似度剪枝邻接
-        # #    获取节点特征（这里用 logits 作 embedding）
-        # embeddings = logits  # [N, C]
-        # row, col = data.edge_index
-        # # 仅一阶边：逐边计算余弦相似度
-        # h_row = embeddings[row]  # [E, C]
-        # h_col = embeddings[col]  # [E, C]
-        # cos_sim = F.cosine_similarity(h_row, h_col, dim=-1)  # [E]
-        # mask = cos_sim >= cos_threshold
-        # # 构造剪枝后的 edge_index
-        # pruned_row = row[mask]
-        # pruned_col = col[mask]
+        # 2. 基于余弦相似度剪枝邻接
+        #    获取节点特征（这里用 logits 作 embedding）
+        embeddings = logits  # [N, C]
+        row, col = data.edge_index
+        # 仅一阶边：逐边计算余弦相似度
+        h_row = embeddings[row]  # [E, C]
+        h_col = embeddings[col]  # [E, C]
+        cos_sim = F.cosine_similarity(h_row, h_col, dim=-1)  # [E]
+        mask = cos_sim >= cos_threshold
+        # 构造剪枝后的 edge_index
+        pruned_row = row[mask]
+        pruned_col = col[mask]
 
         # 3. 传播
-        # e = self.propagation(e, data.edge_index,
-        #                      prop_layers=prop_layers, alpha=alpha)
+        e = self.propagation(neg_energy, (pruned_row, pruned_col),
+                             prop_layers=prop_layers, alpha=alpha)
 
         # 4. 拆分 ID 与 openset
         ind_idx, openset_idx = data.known_in_unseen_mask, data.unknown_in_unseen_mask
@@ -867,54 +614,3 @@ class DGIBNN_mlt(torch.nn.Module):
         for _ in range(prop_layers):
             e = e * alpha + matmul(adj, e) * (1 - alpha)
         return e.squeeze(1)
-
-
-import torch
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-
-def visualize_embeddings_tsne(z_all, z_sample, data, title="t-SNE Visualization of Embeddings"):
-    """
-    可视化表征：训练ID、测试ID、测试OOD 和 伪OOD采样。
-
-    参数:
-        z_all: torch.Tensor, 所有节点的嵌入表示（来自 encoder 输出）
-        z_sample: torch.Tensor, 采样生成的伪OOD嵌入
-        data: PyG 数据对象，需包含 train_mask、known_in_unseen_mask、unknown_in_unseen_mask 掩码
-        title: str, 图标题
-    """
-    z_id_train = z_all[data.train_mask].detach().cpu()
-    z_id_test = z_all[data.known_in_unseen_mask].detach().cpu()
-    z_ood_test = z_all[data.unknown_in_unseen_mask].detach().cpu()
-    z_fake_ood = z_sample.detach().cpu()
-
-    z_all_vis = torch.cat([z_id_train, z_id_test, z_ood_test, z_fake_ood], dim=0)
-    labels = (
-        ['Train ID'] * len(z_id_train) +
-        ['Test Known ID'] * len(z_id_test) +
-        ['Test Unknown OOD'] * len(z_ood_test) +
-        ['Fake OOD (Sample)'] * len(z_fake_ood)
-    )
-
-    tsne = TSNE(n_components=2, random_state=42)
-    z_tsne = tsne.fit_transform(z_all_vis.numpy())
-
-    plt.figure(figsize=(8, 6))
-    colors = {
-        'Train ID': 'green',
-        'Test Known ID': 'blue',
-        'Test Unknown OOD': 'red',
-        'Fake OOD (Sample)': 'black'
-    }
-
-    for label in set(labels):
-        idx = [i for i, l in enumerate(labels) if l == label]
-        plt.scatter(z_tsne[idx, 0], z_tsne[idx, 1], s=20, label=label, alpha=0.6, c=colors[label])
-
-    plt.legend()
-    plt.title(title)
-    plt.xlabel("t-SNE 1")
-    plt.ylabel("t-SNE 2")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()

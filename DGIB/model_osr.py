@@ -740,45 +740,111 @@ class DGIBNN_mlt(torch.nn.Module):
         else:
             return loss
 
+    # def pu_discriminator_loss(self, x_labeled, x_unlabeled, mu=0.5, reduction='mean'):
+    #     # 使用 d_phi 计算正样本和未标记样本的预测概率
+    #     out_pos = torch.clamp(self.d_phi(x_labeled.detach()), 1e-6, 1 - 1e-6)  # 正样本的预测概率
+    #     out_unl = torch.clamp(self.d_phi(x_unlabeled.detach()), 1e-6, 1 - 1e-6)  # 未标记样本的预测概率
+
+    #     # 正样本损失（通过sigmoid计算概率）
+    #     loss_pos = -torch.log(out_pos)  # 计算正样本的损失
+        
+    #     # 反向正样本损失（通过sigmoid计算反向概率）
+    #     loss_pos_inv = -torch.log(1 - out_pos)  # 计算反向正样本的损失
+        
+    #     # 未标记样本损失（通过sigmoid计算负样本的概率）
+    #     loss_unl = -torch.log(1 - out_unl)  # 假设未标记样本作为负类，计算其损失
+
+    #     # 对正样本和未标记样本进行加权
+    #     if reduction == 'mean':
+    #         loss_pos = loss_pos.mean()
+    #         loss_pos_inv = loss_pos_inv.mean()
+    #         loss_unl = loss_unl.mean()
+    #     elif reduction == 'sum':
+    #         loss_pos = loss_pos.sum()
+    #         loss_pos_inv = loss_pos_inv.sum()
+    #         loss_unl = loss_unl.sum()
+    #     else:
+    #         raise ValueError("reduction must be 'mean' or 'sum'")
+
+    #     # 正负样本的损失加权
+    #     positive_risk = mu * loss_pos  # 正样本损失加权
+    #     negative_risk = -mu * loss_pos_inv + loss_unl  # 未标记样本损失加权
+
+    #     # 确保负样本风险非负
+    #     negative_risk = torch.clamp(negative_risk, min=0.0)  # 负样本损失不能为负值
+
+    #     # 最终的PU损失
+    #     pu_loss = positive_risk + negative_risk
+
+    #     return pu_loss
+
     def pu_discriminator_loss(self, x_labeled, x_unlabeled, mu=0.5, reduction='mean'):
         d_phi = self.d_phi
 
         # Output in (0,1), binary prob
-        out_pos = torch.clamp(d_phi(x_labeled.detach()), 1e-6, 1 - 1e-6)  # 正样本的预测概率
-        out_unl = torch.clamp(d_phi(x_unlabeled.detach()), 1e-6, 1 - 1e-6)  # 未标记样本的预测概率
+        out_pos = torch.clamp(d_phi(x_labeled.detach()), 1e-6, 1 - 1e-6)
+        out_unl = torch.clamp(d_phi(x_unlabeled.detach()), 1e-6, 1 - 1e-6)
 
-        # 正样本损失（与1的交叉熵损失）
-        loss_pos = F.binary_cross_entropy(out_pos, torch.ones_like(out_pos), reduction='none')
-        
-        # 反向正样本损失（与0的交叉熵损失）
-        loss_pos_inv = F.binary_cross_entropy(out_pos, torch.zeros_like(out_pos), reduction='none')
-        
-        # 未标记样本损失（与0的交叉熵损失）
-        loss_unl = F.binary_cross_entropy(out_unl, torch.zeros_like(out_unl), reduction='none')
+        # Positive sample loss
+        loss_pos_1 = F.binary_cross_entropy(out_pos, torch.ones_like(out_pos), reduction='none')
+        loss_pos_0 = F.binary_cross_entropy(out_pos, torch.zeros_like(out_pos), reduction='none')
+        # Unlabeled loss as negative
+        loss_unl_0 = F.binary_cross_entropy(out_unl, torch.zeros_like(out_unl), reduction='none')
 
-        # 对正样本和未标记样本进行加权
         if reduction == 'mean':
-            loss_pos = loss_pos.mean()
-            loss_pos_inv = loss_pos_inv.mean()
-            loss_unl = loss_unl.mean()
+            R_p_pos = loss_pos_1.mean()
+            R_p_neg = loss_pos_0.mean()
+            R_u_neg = loss_unl_0.mean()
         elif reduction == 'sum':
-            loss_pos = loss_pos.sum()
-            loss_pos_inv = loss_pos_inv.sum()
-            loss_unl = loss_unl.sum()
+            R_p_pos = loss_pos_1.sum()
+            R_p_neg = loss_pos_0.sum()
+            R_u_neg = loss_unl_0.sum()
         else:
             raise ValueError("reduction must be 'mean' or 'sum'")
 
-        # 正负样本的损失加权
-        positive_risk = self.prior * loss_pos + self.prior * loss_pos_inv  # 正样本损失
-        negative_risk = (1 - self.prior) * loss_unl  # 未标记样本损失
-
-        # 确保负样本风险非负
-        negative_risk = torch.clamp(negative_risk, min=0.0)  # 负样本损失不能为负值
-
-        # 最终的PU损失
-        pu_loss = mu * positive_risk + negative_risk
-
+        # PU risk: positive + max{0, unl_neg - pos_neg}
+        pu_loss = mu * R_p_pos + torch.clamp(R_u_neg - mu * R_p_neg, min=0.0)
         return pu_loss
+    
+
+    # def pu_discriminator_loss(self, x_labeled, x_unlabeled, mu=0.5, reduction='mean', loss_func=(lambda x: torch.sigmoid(-x))):
+    #     # 使用 d_phi 计算正样本和未标记样本的预测概率
+    #     out_pos = torch.clamp(self.d_phi(x_labeled.detach()), 1e-6, 1 - 1e-6)  # 正样本的预测概率
+    #     out_unl = torch.clamp(self.d_phi(x_unlabeled.detach()), 1e-6, 1 - 1e-6)  # 未标记样本的预测概率
+
+    #     # 正样本损失（通过sigmoid计算概率）
+    #     loss_pos = loss_func(out_pos)  # 计算正样本的概率
+        
+    #     # 反向正样本损失（通过sigmoid计算反向概率）
+    #     loss_pos_inv = loss_func(-out_pos)  # 计算反向正样本的概率
+        
+    #     # 未标记样本损失（通过sigmoid计算负样本的概率）
+    #     loss_unl = loss_func(-out_unl)  # 假设未标记样本作为负类，计算其损失
+
+    #     # 对正样本和未标记样本进行加权
+    #     if reduction == 'mean':
+    #         loss_pos = loss_pos.mean()
+    #         loss_pos_inv = loss_pos_inv.mean()
+    #         loss_unl = loss_unl.mean()
+    #     elif reduction == 'sum':
+    #         loss_pos = loss_pos.sum()
+    #         loss_pos_inv = loss_pos_inv.sum()
+    #         loss_unl = loss_unl.sum()
+    #     else:
+    #         raise ValueError("reduction must be 'mean' or 'sum'")
+
+    #     # 正负样本的损失加权
+    #     positive_risk = mu * loss_pos  # 正样本损失
+    #     negative_risk = -mu * loss_pos_inv + loss_unl  # 未标记样本损失
+
+    #     # 确保负样本风险非负
+    #     negative_risk = torch.clamp(negative_risk, min=0.0)  # 负样本损失不能为负值
+
+    #     # 最终的PU损失
+    #     pu_loss = positive_risk + negative_risk
+
+    #     return pu_loss
+
 
     def loss_uncertainty_softmargin(self, energy_id, energy_ood, margin=0.0, tau=1,
                                 squared=False, reduction='mean'):
@@ -906,10 +972,11 @@ class DGIBNN_mlt(torch.nn.Module):
         e = self.propagation(e, data.edge_index,
                              prop_layers=prop_layers, alpha=alpha)
         # 4. 拆分 ID 与 openset
-        ind_idx, openset_idx = data.known_in_unseen_mask, data.unknown_in_unseen_mask
-        neg_energy_ind = e[ind_idx]
-        neg_energy_openset = e[openset_idx]
-        return neg_energy_ind, neg_energy_openset
+        # ind_idx, openset_idx = data.train_mask, data.test_mask
+        # neg_energy_ind = e[ind_idx]
+        # neg_energy_openset = e[openset_idx]
+        # return neg_energy_ind, neg_energy_openset
+        return e
 
     def propagation(self, e, edge_index, prop_layers=2, alpha=0.5):
         """能量传播，返回传播后的标量能量 e"""
@@ -1196,3 +1263,45 @@ def compute_distribution_shift(edge_index, y, num_classes, train_mask, test_mask
     if len(kl_per_class) == 0:
         return float('nan')
     return sum(kl_per_class) / len(kl_per_class)
+
+
+class PULoss(nn.Module):
+    """wrapper of loss function for PU learning"""
+
+    def __init__(self, prior, loss=(lambda x: torch.sigmoid(-x)), gamma=1, beta=0, nnPU=False):
+        super(PULoss,self).__init__()
+
+        if not 0 < prior < 1:
+            raise NotImplementedError("The class prior should be in (0, 1)")
+
+        self.prior = prior
+        self.gamma = gamma
+        self.beta = beta
+        self.loss_func = loss # lambda x: (torch.tensor(1., device=x.device) - torch.sign(x)) / torch.tensor(2, device=x.device)
+        self.nnPU = nnPU
+        self.positive = 1
+        self.unlabeled = -1
+        self.min_count = 1
+    
+    def forward(self, inp, target, test=False):
+        assert(inp.shape == target.shape)        
+
+        if inp.is_cuda:
+            self.prior = self.prior.cuda()
+
+        positive, unlabeled = target == self.positive, target == self.unlabeled
+        positive, unlabeled = positive.type(torch.float), unlabeled.type(torch.float)
+
+        n_positive, n_unlabeled = torch.clamp(torch.sum(positive), min=self.min_count), torch.clamp(torch.sum(unlabeled), min=self.min_count)
+
+        y_positive = self.loss_func(inp) * positive
+        y_positive_inv = self.loss_func(-inp) * positive
+        y_unlabeled = self.loss_func(-inp) * unlabeled
+
+        positive_risk = self.prior * torch.sum(y_positive) / n_positive
+        negative_risk = - self.prior * torch.sum(y_positive_inv) / n_positive + torch.sum(y_unlabeled) / n_unlabeled
+
+        if negative_risk < -self.beta and self.nnPU:
+            return -self.gamma * negative_risk
+
+        return positive_risk + negative_risk

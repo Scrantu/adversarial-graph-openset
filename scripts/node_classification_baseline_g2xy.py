@@ -39,6 +39,15 @@ import numpy as np
 from torch_geometric.data import Data
 import random
 import nni
+from G2Pxy.G2pxy_main import (
+    getmodel,          # 构造 G2pxy 模型
+    relabel_new,       # openset 标签重映射
+    decompose,         # 划分 close / open 集
+    traindummy,        # G2pxy 训练步骤
+    valdummy_extra,    # 验证
+    test_extra         # 测试
+)
+
 
 seed = 0
 random.seed(seed)
@@ -46,6 +55,85 @@ np.random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 import pickle
+
+class G2pxyBaseline(nn.Module):
+    """
+    将 G2pxy 方法封装为一个 baseline 模型，方便在 node_classification_baseline.py 中调用。
+    """
+    def __init__(self, data, num_known_classes, args, device):
+        super().__init__()
+        self.args = args
+        self.device = device
+        self.data = data
+        self.num_known_classes = num_known_classes
+
+        # 重新标记 openset 数据
+        self.new_labels, self.seen_label, self.unseen_label, train_idx, valid_test_idx = relabel_new(args, data.y)
+
+        # 进一步划分 close / open
+        self.valid_closeset, self.valid_openset = decompose(args, valid_test_idx)
+        self.test_closeset, self.test_openset   = decompose(args, valid_test_idx)
+
+        self.train_idx = train_idx
+
+        # 初始化模型
+        self.model = getmodel(args, in_dim=data.x.size(1), nclass=num_known_classes+1).to(device)
+
+        # 优化器
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    def forward(self, x, edge_index):
+        return self.model(x, edge_index)
+
+    def fit(self):
+        """
+        跑原 G2pxy 训练 + 验证循环
+        """
+        best_val_acc = 0
+        for epoch in range(self.args.epochs):
+            # === 训练 ===
+            traindummy(epoch, self.model, self.data, self.train_idx, self.new_labels, self.optimizer)
+
+            # === 验证 ===
+            val_acc = valdummy_extra(epoch, self.model, self.data, self.valid_closeset, self.valid_openset, self.new_labels)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state = self.model.state_dict()
+
+        # 恢复最佳模型
+        self.model.load_state_dict(best_state)
+
+    @torch.no_grad()
+    def detect(self, logits, data, T=1.0, prop_layers=2, alpha=0.5):
+        """
+        返回 IND / OOD 能量分数，兼容 node_classification_baseline.py 的 test()
+        """
+        neg_energy = T * torch.logsumexp(logits / T, dim=-1)
+        neg_energy = self.propagation(neg_energy, data.edge_index, prop_layers, alpha)
+        ind_idx, ood_idx = data.known_in_unseen_mask, data.unknown_in_unseen_mask
+        return neg_energy[ind_idx], neg_energy[ood_idx]
+
+    @staticmethod
+    def propagation(e, edge_index, prop_layers=2, alpha=0.5):
+        e = e.unsqueeze(1)
+        N = e.shape[0]
+        row, col = edge_index
+        d = degree(col, N).float()
+        d_norm = 1. / d[col]
+        value = torch.ones_like(row, dtype=torch.float) * d_norm
+        value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+        adj = SparseTensor(row=col, col=row, value=value, sparse_sizes=(N, N))
+        for _ in range(prop_layers):
+            e = e * alpha + matmul(adj, e) * (1 - alpha)
+        return e.squeeze(1)
+
+    def test(self):
+        """
+        调用原 test_extra 进行测试
+        """
+        return test_extra(self.model, self.data, self.test_closeset, self.test_openset, self.new_labels)
+
+
 
 def make_openset_split_auto(data, known_class_ratio=0.7, train_ratio=0.1, val_ratio=0.1, seed=seed, save_path=None):
     """
@@ -134,8 +222,7 @@ def make_openset_split_auto(data, known_class_ratio=0.7, train_ratio=0.1, val_ra
         pickle.dump(split_info, f)
     # with open('openset_split.pkl', 'rb') as f:
     #     split_info = pickle.load(f)
-    print(f"Train nodes: {(train_idx)}, Val nodes: {(val_idx)}, Test nodes: {(test_idx)}")
-    input("Press Enter to continue...")
+
     return data, num_known, num_classes-num_known
 
 
@@ -261,6 +348,7 @@ def train(model, data, optimizer, device, args):
     loss_cls = F.nll_loss(outs[data.train_mask], y_true[data.train_mask])
     # Combine with DGIB losses
     loss = loss_cls 
+
     loss.backward()
     optimizer.step()
     return loss.item()
@@ -350,7 +438,7 @@ def main():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device (cuda or cpu)')
     parser.add_argument('--save_path', type=str, default='model.pth', help='Saved model')
-    parser.add_argument('--dataset', type=str, default='cora', help='data name')
+    parser.add_argument('--dataset', type=str, default='citeseer', help='data name')
     parser.add_argument('--attack', type=str, default='MetaSelf', help='dice, MetaSelf')
 
     args = parser.parse_args()
@@ -451,6 +539,12 @@ def main():
     args.n_layers = args.n_layers
     args.nout = num_known_classes
     model = GCN(dataset.num_features, args.nhid, num_known_classes, dropout=args.dropout).to(device)
+
+    # 初始化 G2pxy baseline
+    model = G2pxyBaseline(data, num_known_classes, args, device)
+    model.fit()
+    accs = test(model, data, device)
+    input("Test complete. Press Enter to continue...")
 
 
     # Optimizer

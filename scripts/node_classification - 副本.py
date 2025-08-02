@@ -3,16 +3,7 @@
 """
 cora_node_classification.py: Static graph node classification on Cora using DGIBNN architecture.
 """
-from torch_geometric.nn import GCNConv, GATConv, SAGEConv
-from torch_sparse import SparseTensor, matmul
-from torch_geometric.utils import (
-    add_remaining_self_loops,
-    remove_self_loops,
-    add_self_loops,
-    softmax,
-    degree,
-    to_undirected,
-)
+
 import argparse
 import torch
 import torch.nn.functional as F
@@ -24,7 +15,7 @@ sys.path.append('./')
 sys.path.append('../')
 sys.path.append('../../')
 sys.path.append('../../../')
-from DGIB.model_sythetic import DGIBNN
+from DGIB.model_osr import DGIBNN,DGIBNN_mlt
 from tqdm import tqdm
 import os
 from sklearn.model_selection import train_test_split
@@ -38,7 +29,6 @@ from torch_geometric.utils import from_scipy_sparse_matrix
 import numpy as np
 from torch_geometric.data import Data
 import random
-import nni
 
 seed = 0
 random.seed(seed)
@@ -134,8 +124,7 @@ def make_openset_split_auto(data, known_class_ratio=0.7, train_ratio=0.1, val_ra
         pickle.dump(split_info, f)
     # with open('openset_split.pkl', 'rb') as f:
     #     split_info = pickle.load(f)
-    print(f"Train nodes: {(train_idx)}, Val nodes: {(val_idx)}, Test nodes: {(test_idx)}")
-    input("Press Enter to continue...")
+
     return data, num_known, num_classes-num_known
 
 
@@ -247,20 +236,75 @@ def get_measures(_pos, _neg, recall_level=0.95):
 
     return auroc, aupr, fpr, threshould
 
-def train(model, data, optimizer, device, args):
+def train(model: DGIBNN_mlt, data, optimizer, device, args, epoch):
     model.train()
     optimizer.zero_grad()
-    x_all = data.x.to(device)
-    edge_index_all = data.edge_index.to(device)
+    x_all = [data.x.to(device)]
+    edge_index_all = [data.edge_index.to(device)]
     # Forward through DGIBNN
-    embeddings = model(x_all, edge_index_all)
+    embed_last_hid, logits, ixz_loss_s, struct_kl_loss_s = model(x_all, edge_index_all)
+    logits = logits[0]
+    embed_last_hid = embed_last_hid[0]
 
-    outs = F.log_softmax(embeddings, dim=1)
+    outs = F.log_softmax(logits, dim=1)
     # Compute cross-entropy loss on train mask
     y_true = data.y.to(device)
     loss_cls = F.nll_loss(outs[data.train_mask], y_true[data.train_mask])
+
+    # pu loss
+    mu = 0.5
+    loss_pu = model.pu_discriminator_loss(embed_last_hid[data.train_mask], embed_last_hid[data.test_mask], mu = mu)
+    loss_pu = torch.clamp(loss_pu, min=0.0)
+    
     # Combine with DGIB losses
-    loss = loss_cls 
+    lambda_pu = min(1.0, epoch / 50) * 0.1
+    loss = loss_cls \
+           + args.lambda_ixz * ixz_loss_s \
+           + args.lambda_struct * struct_kl_loss_s \
+           + lambda_pu * loss_pu \
+
+    
+    # openset loss
+    with torch.no_grad():
+        probs_all = model.d_phi(embed_last_hid).detach()
+        weights_all = model.compute_openset_weight(probs_all).detach()
+        mask_cand = model.select_topk_ood_candidates(weights_all, mu, data.test_mask).detach()
+
+    if epoch > 20:
+        # --------------------------- 伪 OOD 对齐（加权版本） ---------------------------
+        # model.d_phi.eval()
+        z_pos = embed_last_hid[data.train_mask]  # 假设第一个分支输出是 ID 嵌入
+        logits_pos = logits[data.train_mask]
+        energy_ind = - torch.logsumexp(logits_pos, dim=-1).squeeze()
+        # print('energy_ind', energy_ind)
+
+        z_cand = embed_last_hid[mask_cand]
+        weights_cand = weights_all[mask_cand].detach()
+        z_sample = model.sample(
+            sample_size=len(z_pos),
+            max_buffer_len=int(model.max_buffer_vol * len(z_pos)),
+            device=args.device,
+            x_cand=z_cand,  # 加入候选伪OOD
+            weights_cand=weights_cand
+        )
+        z_sample = F.elu(z_sample)
+        z_sample = F.normalize(z_sample, dim=-1)
+        logits_pop = model.branch1_cls(z_sample)
+        energy_pop = - torch.logsumexp(logits_pop, dim=-1).squeeze()
+
+        # if epoch % 10 == 0:
+        #     visualize_embeddings_tsne(z_all, z_sample, data)
+
+        loss_uncertainty = torch.mean(F.relu(energy_ind - 0) ** 2 + F.relu(1 - energy_pop) ** 2)
+        loss_reg = torch.mean(energy_ind.pow(2) + energy_pop.pow(2))
+        # loss_uncertainty = model.loss_uncertainty_softmargin(energy_ind, energy_pop)
+        # loss_uncertainty = (energy_ind - energy_sample).mean()
+        lambda_uncertainty = min(1.0, (epoch - 20) / 50) * 0.1 if epoch > 20 else 0.0
+        lambda_reg = min(1.0, (epoch - 20) / 50) * 0.01 if epoch > 20 else 0.0
+
+        loss = loss + lambda_uncertainty * loss_uncertainty + lambda_reg * loss_reg
+    
+    
     loss.backward()
     optimizer.step()
     return loss.item()
@@ -268,58 +312,23 @@ def train(model, data, optimizer, device, args):
 @torch.no_grad()
 def test(model, data, device):
     model.eval()
-    x_all = data.x.to(device)
-    edge_index_all = data.edge_index.to(device)
-    logits = model(x_all, edge_index_all)
+    x_all = [data.x.to(device)]
+    edge_index_all = [data.edge_index.to(device)]
+    embed_last_hid, logits, _,  _,  = model(x_all, edge_index_all)
+    logits = logits[0]
     outs = F.log_softmax(logits, dim=1)
-    # print('outs', outs)
     y_true = data.y.to(device)
     accs = {}
     for split in ['train', 'val', 'test', 'known_in_unseen']:
         mask = getattr(data, f"{split}_mask").to(device)
         accs[split] = accuracy(outs[mask], y_true[mask])
+
+    # e = - model.energy_net(embed_last_hid[0]).squeeze()
     test_ind_score, test_openset_score = model.detect(logits.to(device), data.to(device))
     auroc, aupr, fpr, _ = get_measures(test_ind_score.cpu(), test_openset_score.cpu())
     accs['openset'] = [auroc] + [aupr] + [fpr]
 
     return accs
-
-class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
-        super().__init__()
-        self.conv1 = GATConv(in_channels, hidden_channels)
-        self.conv2 = GATConv(hidden_channels, out_channels)
-        self.dropout = dropout
-
-    def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.conv2(x, edge_index)
-        return x
-    
-    def detect(self, logits, data, T=1.0):
-        neg_energy = T * torch.logsumexp(logits / T, dim=-1)
-        neg_energy = self.propagation(neg_energy, data.edge_index)
-        ind_idx, openset_idx = data.known_in_unseen_mask, data.unknown_in_unseen_mask
-
-        neg_energy_ind = neg_energy[ind_idx]
-        neg_energy_openset = neg_energy[openset_idx]
-        return neg_energy_ind, neg_energy_openset
-    
-    def propagation(self, e, edge_index, prop_layers=2, alpha=0.5):
-        '''energy belief propagation, return the energy after propagation'''
-        e = e.unsqueeze(1)
-        N = e.shape[0]
-        row, col = edge_index
-        d = degree(col, N).float()
-        d_norm = 1. / d[col]
-        value = torch.ones_like(row) * d_norm
-        value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
-        adj = SparseTensor(row=col, col=row, value=value, sparse_sizes=(N, N))
-        for _ in range(prop_layers):
-            e = e * alpha + matmul(adj, e) * (1 - alpha)
-        return e.squeeze(1)
 
 
 def main():
@@ -332,28 +341,30 @@ def main():
     parser.add_argument('--heads', type=int, default=1, help='Attention heads')
     parser.add_argument('--reparam_mode', type=str, default='diag', help='Reparameterization mode for XIB. Choose from "None", "diag" or "full"')
     parser.add_argument('--prior_mode', type=str, default='Gaussian', help='Prior mode. Choose from "Gaussian" or "mixGau-10" (mixture of 10 Gaussian components)')
-    parser.add_argument('--distribution', type=str, default='Bernoulli', help="categorical,Bernoulli")
+    parser.add_argument('--distribution', type=str, default='categorical', help="categorical,Bernoulli")
     parser.add_argument('--temperature', type=float, default=1, help='Sampling temperature')
     parser.add_argument('--nbsz', type=int, default=20, help='Neighbor sample size')
     parser.add_argument('--sample_size', type=int, default=50, help='Reparameterize samples')
     # Loss weights
     # good:(0.01, 0.001)
-    parser.add_argument('--lambda_ixz', type=float, default=0.00, help='Weight for I(X;Z) loss')
-    parser.add_argument('--lambda_struct', type=float, default=0.00, help='Weight for structure KL loss')
+    parser.add_argument('--lambda_ixz', type=float, default=0.005, help='Weight for I(X;Z) loss')
+    parser.add_argument('--lambda_struct', type=float, default=0.005, help='Weight for structure KL loss')
     parser.add_argument('--lambda_cons', type=float, default=0.0, help='Weight for consensual loss')
     # Training
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay')
+    parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=5e-7, help='Weight decay')
     parser.add_argument('--epochs', type=int, default=1000, help='Number of epochs')
     parser.add_argument('--patience', type=int, default=200, help='Early stopping patience')
 
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device (cuda or cpu)')
     parser.add_argument('--save_path', type=str, default='model.pth', help='Saved model')
-    parser.add_argument('--dataset', type=str, default='cora', help='data name')
-    parser.add_argument('--attack', type=str, default='MetaSelf', help='dice, MetaSelf')
+    parser.add_argument('--dataset', type=str, default='citeseer', help='data name')
 
     args = parser.parse_args()
+
+    if args.dataset == 'citeseer':
+        args.distribution = 'Bernoulli'
 
     # Load Cora dataset
     dataset = Planetoid(root='../data/cora', name=args.dataset)
@@ -366,10 +377,7 @@ def main():
         data, known_class_ratio=known_class_ratio, train_ratio=train_ratio, val_ratio=val_ratio, seed=seed, 
         save_path=f"{args.dataset}-{str(known_class_ratio)}-{str(train_ratio)}-{str(val_ratio)}-{str(seed)}.pkl")
     print('num_known_classes', num_known_classes, num_unknown_classes)
-    if args.attack == 'MetaSelf':
-        adj = load_npz_as_pyg_data(f"C:/Users/zhaoc/Desktop/DeepRobust-latest/examples/graph/data/mod_graph_{args.dataset}-0.7-0.1-0.1-0-MetaSelf-0.15-gnnsafe/mod_adj.npz")
-    elif args.attack == 'dice':
-        adj = torch.load(f"C:/Users/zhaoc/Desktop/DeepRobust-latest/examples/graph/data/mod_graph_{args.dataset}-0.7-0.1-0.1-0-dice-0.15/mod_adj.pt", map_location='cpu')
+    adj = load_npz_as_pyg_data(f"C:/Users/zhaoc/Desktop/DeepRobust-latest/examples/graph/data/mod_graph_{args.dataset}-0.7-0.1-0.1-0-MetaSelf-0.15-gnnsafe/mod_adj.npz")
 
      # 对比
     ###################
@@ -397,49 +405,14 @@ def main():
     print(f"Common edges: {len(intersection)}")
     print(f"Edges only in original: {len(edges_only_in_original)}")
     print(f"Edges only in modified: {len(edges_only_in_mod)}")
-
-    # 节点索引集合
-    train_set = set(data.train_mask.nonzero(as_tuple=True)[0].tolist())
-    test_set = set(data.test_mask.nonzero(as_tuple=True)[0].tolist())
-
-    # 统计函数
-    def count_edge_types(edge_set, train_set, test_set):
-        tt, tr_te, te_te = 0, 0, 0
-        for u, v in edge_set:
-            if u in train_set and v in train_set:
-                tt += 1
-            elif (u in train_set and v in test_set) or (v in train_set and u in test_set):
-                tr_te += 1
-            elif u in test_set and v in test_set:
-                te_te += 1
-        total = len(edge_set)
-        return {
-            'train-train': tt / total if total > 0 else 0,
-            'train-test': tr_te / total if total > 0 else 0,
-            'test-test': te_te / total if total > 0 else 0,
-            'total': total
-        }
-
-    # 分别统计新增边和删除边的比例分布
-    added_stats = count_edge_types(edges_only_in_mod, train_set, test_set)
-    removed_stats = count_edge_types(edges_only_in_original, train_set, test_set)
-
-    # 打印结果
-    print("== Modified Edge Stats ==")
-    print(f"Original edge count: {len(original_edge_set)}")
-    print(f"Modified edge count: {len(mod_edge_set)}")
-    print(f"Common edges: {len(original_edge_set & mod_edge_set)}")
-    print(f"Edges only in original (deleted): {len(edges_only_in_original)}")
-    print(f"Edges only in modified (added): {len(edges_only_in_mod)}\n")
-
-    print("== Added Edge Distribution ==")
-    for k, v in added_stats.items():
-        print(f"{k}: {v:.2%}")
-
-    print("\n== Removed Edge Distribution ==")
-    for k, v in removed_stats.items():
-        print(f"{k}: {v:.2%}")
     ########################
+
+    num_test = data.test_mask.sum().item()
+    num_known_in_test = (data.unknown_in_unseen_mask & data.test_mask).sum().item()
+    ratio = num_known_in_test / num_test if num_test > 0 else 0.0
+    print(f"测试集总样本数：{num_test}")
+    print(f"测试集中 Known-in-Unseen 样本数：{num_known_in_test}")
+    print(f"Known-in-Unseen 占测试集的比例：{ratio:.4f}")
 
 
     data.edge_index = adj
@@ -450,9 +423,7 @@ def main():
     args.nhid = args.nhid
     args.n_layers = args.n_layers
     args.nout = num_known_classes
-    model = GCN(dataset.num_features, args.nhid, num_known_classes, dropout=args.dropout).to(device)
-
-
+    model = DGIBNN_mlt(args).to(device)
     # Optimizer
     optimizer = torch.optim.Adam(
         list(model.parameters()),
@@ -468,7 +439,7 @@ def main():
     ood_auroc_list = [] 
     # Training loop
     for epoch in tqdm(range(1, args.epochs + 1)):
-        loss = train(model, data, optimizer, device, args)
+        loss = train(model, data, optimizer, device, args, epoch)
         accs = test(model, data, device)
         if accs['val'] > best_val:
             best_val = accs['val']
@@ -496,7 +467,6 @@ def main():
         id_test_acc_list.append(accs['known_in_unseen'].cpu())
         id_val_acc_list.append(accs['val'].cpu())
         ood_auroc_list.append(accs['openset'][0])  # AUROC
-
 
     # Load best model and evaluate
     print(f"\nBest validation/test overall accuracy/test ind accuracy/openset detection: {best_val:.4f}/{best_overall_test:.4f}/{best_known_in_test:.4f}/{best_openset_metrics}, model saved to {args.save_path}")
